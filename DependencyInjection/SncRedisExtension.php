@@ -255,7 +255,8 @@ class SncRedisExtension extends Extension
     {
         $connectionCount = count($client['dsns']);
 
-        if (1 !== $connectionCount) {
+        $redisClient = $container->getParameter('snc_redis.phpredis_client.class');
+        if (1 !== $connectionCount && $redisClient !== '\RedisCluster') {
             throw new \RuntimeException('Support for RedisArray is not yet implemented.');
         }
 
@@ -263,7 +264,23 @@ class SncRedisExtension extends Extension
         /** @var \Snc\RedisBundle\DependencyInjection\Configuration\RedisDsn $dsn */
         $phpredisId = sprintf('snc_redis.phpredis.%s', $client['alias']);
 
-        $phpredisDef = new Definition($container->getParameter('snc_redis.phpredis_client.class'));
+        if ($redisClient === '\RedisCluster') {
+            // phpredis with Redis Cluster
+            $clusterArray = [];
+            foreach ($client['dsns'] as $clusterDsn) {
+                $clusterArray[] = $clusterDsn->getHost() . ':' . $clusterDsn->getPort();
+            }
+            $phpredisDef = new Definition($container->getParameter('snc_redis.phpredis_client.class'), [
+                $phpredisId,
+                $clusterArray,
+                $client['options']['connection_timeout'] ?? null,
+                $client['options']['read_write_timeout'] ?? null,
+                $client['options']['connection_persistent'] ?? false
+            ]);
+        } else {
+            $phpredisDef = new Definition($container->getParameter('snc_redis.phpredis_client.class'));
+        }
+
         if ($client['logging']) {
             $phpredisDef = new Definition($container->getParameter('snc_redis.phpredis_connection_wrapper.class'));
             $phpredisDef->addArgument(array('alias' => $client['alias']));
@@ -272,32 +289,36 @@ class SncRedisExtension extends Extension
 
         $phpredisDef->addTag('snc_redis.client', array('alias' => $client['alias']));
         $phpredisDef->setPublic(false);
-        $connectMethod = $client['options']['connection_persistent'] ? 'pconnect' : 'connect';
-        $connectParameters = array();
-        if (null !== $dsn->getSocket()) {
-            $connectParameters[] = $dsn->getSocket();
-            $connectParameters[] = null;
-        } else {
-            $connectParameters[] = $dsn->getHost();
-            $connectParameters[] = $dsn->getPort();
-        }
-        if ($client['options']['connection_timeout']) {
-            $connectParameters[] = $client['options']['connection_timeout'];
-        } else {
-            $connectParameters[] = null;
-        }
-        if ($client['options']['connection_persistent']) {
-            $connectParameters[] = $dsn->getPersistentId();
+
+        if ($redisClient !== '\RedisCluster') {
+            $connectMethod = $client['options']['connection_persistent'] ? 'pconnect' : 'connect';
+            $connectParameters = [];
+            if (null !== $dsn->getSocket()) {
+                $connectParameters[] = $dsn->getSocket();
+                $connectParameters[] = null;
+            } else {
+                $connectParameters[] = $dsn->getHost();
+                $connectParameters[] = $dsn->getPort();
+            }
+            if ($client['options']['connection_timeout']) {
+                $connectParameters[] = $client['options']['connection_timeout'];
+            } else {
+                $connectParameters[] = null;
+            }
+            if ($client['options']['connection_persistent']) {
+                $connectParameters[] = $dsn->getPersistentId();
+            }
+
+            $phpredisDef->addMethodCall($connectMethod, $connectParameters);
+            if ($client['options']['prefix']) {
+                $phpredisDef->addMethodCall('setOption', array(\Redis::OPT_PREFIX, $client['options']['prefix']));
+            }
         }
 
-        $phpredisDef->addMethodCall($connectMethod, $connectParameters);
-        if ($client['options']['prefix']) {
-            $phpredisDef->addMethodCall('setOption', array(\Redis::OPT_PREFIX, $client['options']['prefix']));
-        }
         if (null !== $dsn->getPassword()) {
             $phpredisDef->addMethodCall('auth', array($dsn->getPassword()));
         }
-        if (null !== $dsn->getDatabase()) {
+        if (null !== $dsn->getDatabase() && $redisClient !== '\RedisCluster') {
             $phpredisDef->addMethodCall('select', array($dsn->getDatabase()));
         }
         $container->setDefinition($phpredisId, $phpredisDef);
